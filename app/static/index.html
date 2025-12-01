@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flash Detector - Industrial Vision Inspection</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+    <style>
+        .gradient-bg {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .slider-track {
+            background: linear-gradient(to right, #4f46e5, #7c3aed);
+        }
+        input[type="range"] {
+            -webkit-appearance: none;
+            height: 6px;
+            border-radius: 3px;
+            background: #374151;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #7c3aed;
+            cursor: pointer;
+            border: 2px solid white;
+        }
+        .result-good { color: #10b981; }
+        .result-warning { color: #f59e0b; }
+        .result-bad { color: #ef4444; }
+        .image-container {
+            position: relative;
+            background: #1f2937;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .image-container img {
+            max-width: 100%;
+            height: auto;
+        }
+        .drop-zone {
+            border: 2px dashed #4b5563;
+            transition: all 0.3s ease;
+        }
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: #7c3aed;
+            background: rgba(124, 58, 237, 0.1);
+        }
+        .loading-spinner {
+            border: 3px solid #374151;
+            border-top: 3px solid #7c3aed;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="gradient-bg min-h-screen text-white">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback } = React;
+
+        // API base URL
+        const API_BASE = '/api';
+
+        // Parameter configuration
+        const PARAM_CONFIG = {
+            threshold_method: {
+                label: "Threshold Method",
+                type: "select",
+                options: ["otsu", "manual", "adaptive"],
+                description: "Method for converting grayscale to binary"
+            },
+            manual_threshold: {
+                label: "Manual Threshold",
+                type: "range",
+                min: 0, max: 255, step: 1,
+                showWhen: (p) => p.threshold_method === "manual",
+                description: "Threshold value (0-255)"
+            },
+            adaptive_block_size: {
+                label: "Adaptive Block Size",
+                type: "range",
+                min: 3, max: 101, step: 2,
+                showWhen: (p) => p.threshold_method === "adaptive",
+                description: "Block size for adaptive threshold (odd number)"
+            },
+            adaptive_c: {
+                label: "Adaptive C",
+                type: "range",
+                min: -20, max: 20, step: 1,
+                showWhen: (p) => p.threshold_method === "adaptive",
+                description: "Constant subtracted from mean"
+            },
+            morph_enabled: {
+                label: "Morphological Operations",
+                type: "checkbox",
+                description: "Apply morphological cleanup"
+            },
+            morph_operation: {
+                label: "Morph Operation",
+                type: "select",
+                options: ["close", "open", "dilate", "erode"],
+                showWhen: (p) => p.morph_enabled,
+                description: "Type of morphological operation"
+            },
+            morph_kernel_size: {
+                label: "Morph Kernel Size",
+                type: "range",
+                min: 1, max: 15, step: 2,
+                showWhen: (p) => p.morph_enabled,
+                description: "Size of morphological kernel"
+            },
+            morph_iterations: {
+                label: "Morph Iterations",
+                type: "range",
+                min: 1, max: 5, step: 1,
+                showWhen: (p) => p.morph_enabled,
+                description: "Number of iterations"
+            },
+            roi_enabled: {
+                label: "ROI Detection",
+                type: "checkbox",
+                description: "Auto-detect circular region of interest"
+            },
+            roi_margin: {
+                label: "ROI Margin",
+                type: "range",
+                min: 0, max: 50, step: 1,
+                showWhen: (p) => p.roi_enabled,
+                description: "Pixels to shrink from detected edge"
+            },
+            use_reference_threshold: {
+                label: "Use Reference Threshold",
+                type: "checkbox",
+                description: "Apply reference threshold to test image"
+            },
+            min_flash_area: {
+                label: "Min Flash Area",
+                type: "range",
+                min: 0, max: 1000, step: 10,
+                description: "Minimum pixels to count as flash defect"
+            },
+            alignment_method: {
+                label: "Alignment Method",
+                type: "select",
+                options: ["sift", "orb", "none"],
+                description: "Feature matching method for alignment"
+            },
+            ransac_threshold: {
+                label: "RANSAC Threshold",
+                type: "range",
+                min: 1, max: 20, step: 0.5,
+                showWhen: (p) => p.alignment_method !== "none",
+                description: "Threshold for RANSAC outlier rejection"
+            }
+        };
+
+        // Parameter Control Component
+        function ParamControl({ name, config, value, onChange, params }) {
+            if (config.showWhen && !config.showWhen(params)) {
+                return null;
+            }
+
+            const id = `param-${name}`;
+
+            return (
+                <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={id}>
+                        {config.label}
+                        <span className="text-xs text-gray-500 ml-2">({config.description})</span>
+                    </label>
+                    
+                    {config.type === "select" && (
+                        <select
+                            id={id}
+                            value={value}
+                            onChange={(e) => onChange(name, e.target.value)}
+                            className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-purple-500"
+                        >
+                            {config.options.map(opt => (
+                                <option key={opt} value={opt}>{opt}</option>
+                            ))}
+                        </select>
+                    )}
+                    
+                    {config.type === "range" && (
+                        <div className="flex items-center gap-3">
+                            <input
+                                id={id}
+                                type="range"
+                                min={config.min}
+                                max={config.max}
+                                step={config.step}
+                                value={value}
+                                onChange={(e) => onChange(name, parseFloat(e.target.value))}
+                                className="flex-1"
+                            />
+                            <span className="text-sm text-purple-400 w-12 text-right">{value}</span>
+                        </div>
+                    )}
+                    
+                    {config.type === "checkbox" && (
+                        <label className="flex items-center cursor-pointer">
+                            <input
+                                id={id}
+                                type="checkbox"
+                                checked={value}
+                                onChange={(e) => onChange(name, e.target.checked)}
+                                className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-purple-600 focus:ring-purple-500"
+                            />
+                            <span className="ml-2 text-sm text-gray-400">Enabled</span>
+                        </label>
+                    )}
+                </div>
+            );
+        }
+
+        // Image Upload Component
+        function ImageUpload({ label, onUpload, preview, isReference }) {
+            const [dragOver, setDragOver] = useState(false);
+            const [uploading, setUploading] = useState(false);
+
+            const handleDrop = useCallback((e) => {
+                e.preventDefault();
+                setDragOver(false);
+                const file = e.dataTransfer.files[0];
+                if (file) handleFile(file);
+            }, []);
+
+            const handleFile = async (file) => {
+                setUploading(true);
+                await onUpload(file);
+                setUploading(false);
+            };
+
+            return (
+                <div className="card rounded-lg p-4">
+                    <h3 className="text-lg font-semibold mb-3 text-purple-400">{label}</h3>
+                    
+                    <div
+                        className={`drop-zone rounded-lg p-6 text-center cursor-pointer ${dragOver ? 'dragover' : ''}`}
+                        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                        onDragLeave={() => setDragOver(false)}
+                        onDrop={handleDrop}
+                        onClick={() => document.getElementById(`file-${isReference ? 'ref' : 'test'}`).click()}
+                    >
+                        <input
+                            id={`file-${isReference ? 'ref' : 'test'}`}
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])}
+                        />
+                        
+                        {uploading ? (
+                            <div className="flex justify-center">
+                                <div className="loading-spinner"></div>
+                            </div>
+                        ) : preview ? (
+                            <img src={`data:image/png;base64,${preview}`} alt={label} className="max-h-48 mx-auto rounded" />
+                        ) : (
+                            <div>
+                                <svg className="mx-auto h-12 w-12 text-gray-500 mb-2" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                                    <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                </svg>
+                                <p className="text-gray-400">Drop image here or click to browse</p>
+                                <p className="text-xs text-gray-500 mt-1">PNG, JPG, BMP up to 50MB</p>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        // Results Display Component
+        function ResultsDisplay({ result, images }) {
+            if (!result) return null;
+
+            const getFlashClass = (pct) => {
+                if (pct < 5) return 'result-good';
+                if (pct < 20) return 'result-warning';
+                return 'result-bad';
+            };
+
+            return (
+                <div className="card rounded-lg p-4 mt-4">
+                    <h3 className="text-lg font-semibold mb-4 text-purple-400">Detection Results</h3>
+                    
+                    {/* Metrics Grid */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                        <div className="bg-gray-800 rounded-lg p-3 text-center">
+                            <div className={`text-2xl font-bold ${getFlashClass(result.flash_percentage)}`}>
+                                {result.flash_percentage.toFixed(2)}%
+                            </div>
+                            <div className="text-xs text-gray-400">Flash Percentage</div>
+                        </div>
+                        <div className="bg-gray-800 rounded-lg p-3 text-center">
+                            <div className="text-2xl font-bold text-blue-400">{result.iou.toFixed(1)}%</div>
+                            <div className="text-xs text-gray-400">IoU (Alignment)</div>
+                        </div>
+                        <div className="bg-gray-800 rounded-lg p-3 text-center">
+                            <div className="text-xl font-bold text-green-400">{result.flash_pixels.toLocaleString()}</div>
+                            <div className="text-xs text-gray-400">Flash Pixels</div>
+                        </div>
+                        <div className="bg-gray-800 rounded-lg p-3 text-center">
+                            <div className="text-xl font-bold text-yellow-400">{result.rotation_degrees.toFixed(2)}°</div>
+                            <div className="text-xs text-gray-400">Rotation</div>
+                        </div>
+                    </div>
+
+                    {/* Additional metrics */}
+                    <div className="grid grid-cols-3 gap-2 text-sm mb-4">
+                        <div className="text-gray-400">Reference openings: <span className="text-white">{result.reference_opening_pixels.toLocaleString()}</span></div>
+                        <div className="text-gray-400">Test openings: <span className="text-white">{result.test_opening_pixels.toLocaleString()}</span></div>
+                        <div className="text-gray-400">Threshold: <span className="text-white">{result.threshold_value}</span></div>
+                    </div>
+                    
+                    {/* Result Images */}
+                    {images && images.composite && (
+                        <div className="image-container">
+                            <img src={`data:image/png;base64,${images.composite}`} alt="Detection Result" />
+                            <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs">
+                                TL: Reference | TR: Test | BL: Flash (red) | BR: Overlay
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Main App Component
+        function App() {
+            const [params, setParams] = useState({
+                threshold_method: "otsu",
+                manual_threshold: 128,
+                adaptive_block_size: 51,
+                adaptive_c: 5,
+                morph_enabled: true,
+                morph_operation: "close",
+                morph_kernel_size: 3,
+                morph_iterations: 1,
+                roi_enabled: true,
+                roi_margin: 10,
+                use_reference_threshold: true,
+                min_flash_area: 100,
+                alignment_method: "sift",
+                ransac_threshold: 5.0
+            });
+
+            const [referencePreview, setReferencePreview] = useState(null);
+            const [testPreview, setTestPreview] = useState(null);
+            const [referenceInfo, setReferenceInfo] = useState(null);
+            const [result, setResult] = useState(null);
+            const [resultImages, setResultImages] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [error, setError] = useState(null);
+            const [autoDetect, setAutoDetect] = useState(false);
+
+            // Load initial params from server
+            useEffect(() => {
+                fetch(`${API_BASE}/params`)
+                    .then(res => res.json())
+                    .then(data => setParams(prev => ({ ...prev, ...data })))
+                    .catch(err => console.error('Failed to load params:', err));
+            }, []);
+
+            // Update server params when local params change
+            const updateParams = useCallback(async (newParams) => {
+                try {
+                    await fetch(`${API_BASE}/params`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(newParams)
+                    });
+                } catch (err) {
+                    console.error('Failed to update params:', err);
+                }
+            }, []);
+
+            const handleParamChange = (name, value) => {
+                const newParams = { ...params, [name]: value };
+                setParams(newParams);
+                updateParams(newParams);
+                
+                // Auto-refresh reference preview if needed
+                if (referencePreview && ['threshold_method', 'manual_threshold', 'adaptive_block_size', 
+                    'adaptive_c', 'morph_enabled', 'morph_operation', 'morph_kernel_size', 
+                    'morph_iterations', 'roi_enabled', 'roi_margin'].includes(name)) {
+                    refreshReferencePreview();
+                }
+            };
+
+            const refreshReferencePreview = async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/reference/preview`);
+                    const data = await res.json();
+                    if (data.status === 'success') {
+                        setReferencePreview(data.binary);
+                        setReferenceInfo(data.info);
+                    }
+                } catch (err) {
+                    console.error('Failed to refresh preview:', err);
+                }
+            };
+
+            const uploadReference = async (file) => {
+                setError(null);
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    const res = await fetch(`${API_BASE}/reference`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+                    
+                    if (data.status === 'success') {
+                        setReferencePreview(data.preview);
+                        setReferenceInfo(data.info);
+                    } else {
+                        setError(data.error);
+                    }
+                } catch (err) {
+                    setError('Failed to upload reference image');
+                }
+            };
+
+            const uploadTestAndDetect = async (file) => {
+                if (!referencePreview) {
+                    setError('Please upload a reference image first');
+                    return;
+                }
+
+                setError(null);
+                setLoading(true);
+
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    const res = await fetch(`${API_BASE}/detect`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+                    
+                    if (data.status === 'success') {
+                        setResult(data.result);
+                        setResultImages(data.images);
+                        setTestPreview(data.images.test_binary);
+                    } else {
+                        setError(data.error);
+                    }
+                } catch (err) {
+                    setError('Failed to run detection');
+                }
+                
+                setLoading(false);
+            };
+
+            const resetParams = async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/params/reset`, { method: 'POST' });
+                    const data = await res.json();
+                    if (data.status === 'success') {
+                        setParams(data.params);
+                        if (referencePreview) refreshReferencePreview();
+                    }
+                } catch (err) {
+                    setError('Failed to reset parameters');
+                }
+            };
+
+            return (
+                <div className="container mx-auto px-4 py-6 max-w-7xl">
+                    {/* Header */}
+                    <header className="text-center mb-8">
+                        <h1 className="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-pink-500">
+                            Flash Detector
+                        </h1>
+                        <p className="text-gray-400 mt-2">Industrial Vision Inspection System</p>
+                    </header>
+
+                    {/* Error Display */}
+                    {error && (
+                        <div className="bg-red-900 border border-red-700 text-red-200 px-4 py-3 rounded mb-4">
+                            {error}
+                            <button onClick={() => setError(null)} className="float-right">&times;</button>
+                        </div>
+                    )}
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        {/* Left Panel - Parameters */}
+                        <div className="lg:col-span-1">
+                            <div className="card rounded-lg p-4 sticky top-4">
+                                <div className="flex justify-between items-center mb-4">
+                                    <h2 className="text-xl font-semibold text-purple-400">Parameters</h2>
+                                    <button
+                                        onClick={resetParams}
+                                        className="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded"
+                                    >
+                                        Reset
+                                    </button>
+                                </div>
+
+                                <div className="space-y-1 max-h-[70vh] overflow-y-auto pr-2">
+                                    {/* Binarization Section */}
+                                    <h3 className="text-sm font-medium text-gray-400 mb-2 mt-4 border-b border-gray-700 pb-1">
+                                        Binarization
+                                    </h3>
+                                    {['threshold_method', 'manual_threshold', 'adaptive_block_size', 'adaptive_c'].map(name => (
+                                        <ParamControl
+                                            key={name}
+                                            name={name}
+                                            config={PARAM_CONFIG[name]}
+                                            value={params[name]}
+                                            onChange={handleParamChange}
+                                            params={params}
+                                        />
+                                    ))}
+
+                                    {/* Morphology Section */}
+                                    <h3 className="text-sm font-medium text-gray-400 mb-2 mt-4 border-b border-gray-700 pb-1">
+                                        Morphology
+                                    </h3>
+                                    {['morph_enabled', 'morph_operation', 'morph_kernel_size', 'morph_iterations'].map(name => (
+                                        <ParamControl
+                                            key={name}
+                                            name={name}
+                                            config={PARAM_CONFIG[name]}
+                                            value={params[name]}
+                                            onChange={handleParamChange}
+                                            params={params}
+                                        />
+                                    ))}
+
+                                    {/* ROI Section */}
+                                    <h3 className="text-sm font-medium text-gray-400 mb-2 mt-4 border-b border-gray-700 pb-1">
+                                        Region of Interest
+                                    </h3>
+                                    {['roi_enabled', 'roi_margin'].map(name => (
+                                        <ParamControl
+                                            key={name}
+                                            name={name}
+                                            config={PARAM_CONFIG[name]}
+                                            value={params[name]}
+                                            onChange={handleParamChange}
+                                            params={params}
+                                        />
+                                    ))}
+
+                                    {/* Detection Section */}
+                                    <h3 className="text-sm font-medium text-gray-400 mb-2 mt-4 border-b border-gray-700 pb-1">
+                                        Detection
+                                    </h3>
+                                    {['use_reference_threshold', 'min_flash_area', 'alignment_method', 'ransac_threshold'].map(name => (
+                                        <ParamControl
+                                            key={name}
+                                            name={name}
+                                            config={PARAM_CONFIG[name]}
+                                            value={params[name]}
+                                            onChange={handleParamChange}
+                                            params={params}
+                                        />
+                                    ))}
+                                </div>
+
+                                {/* Reference Info */}
+                                {referenceInfo && (
+                                    <div className="mt-4 p-3 bg-gray-800 rounded text-xs">
+                                        <div className="text-gray-400">Threshold: <span className="text-white">{referenceInfo.threshold}</span></div>
+                                        <div className="text-gray-400">ROI Center: <span className="text-white">{referenceInfo.roi_center?.join(', ')}</span></div>
+                                        <div className="text-gray-400">ROI Radius: <span className="text-white">{referenceInfo.roi_radius}px</span></div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Right Panel - Images and Results */}
+                        <div className="lg:col-span-2">
+                            {/* Image Upload Section */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                <ImageUpload
+                                    label="Reference Image (Golden Sample)"
+                                    onUpload={uploadReference}
+                                    preview={referencePreview}
+                                    isReference={true}
+                                />
+                                <ImageUpload
+                                    label="Test Image (To Inspect)"
+                                    onUpload={uploadTestAndDetect}
+                                    preview={testPreview}
+                                    isReference={false}
+                                />
+                            </div>
+
+                            {/* Loading Indicator */}
+                            {loading && (
+                                <div className="flex justify-center items-center py-8">
+                                    <div className="loading-spinner mr-3"></div>
+                                    <span className="text-gray-400">Processing...</span>
+                                </div>
+                            )}
+
+                            {/* Results Display */}
+                            <ResultsDisplay result={result} images={resultImages} />
+
+                            {/* Usage Instructions */}
+                            {!referencePreview && !result && (
+                                <div className="card rounded-lg p-6 text-center">
+                                    <h3 className="text-lg font-semibold mb-4 text-purple-400">Getting Started</h3>
+                                    <ol className="text-left text-gray-400 space-y-2 max-w-md mx-auto">
+                                        <li>1. Upload a <strong className="text-white">Reference Image</strong> (golden sample without defects)</li>
+                                        <li>2. Adjust <strong className="text-white">Parameters</strong> on the left to optimize binarization</li>
+                                        <li>3. Upload a <strong className="text-white">Test Image</strong> to inspect for flash defects</li>
+                                        <li>4. View results showing flash percentage and location</li>
+                                    </ol>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Footer */}
+                    <footer className="text-center text-gray-500 text-sm mt-8 pb-4">
+                        Flash Detector v1.0 | Solomon-3D Vision Systems
+                    </footer>
+                </div>
+            );
+        }
+
+        // Render the app
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
