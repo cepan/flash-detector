@@ -209,29 +209,33 @@ def detect_flash():
             "overlay": encode_image_base64(result.overlay_image),
         }
         
-        # Create composite visualization
+        # Create test + flash visualization
+        # Show test binary with flash defects highlighted in red
+        test_flash_viz = cv2.cvtColor(result.test_binary_aligned, cv2.COLOR_GRAY2BGR)
+        test_flash_viz[result.flash_mask > 0] = [0, 0, 255]  # Highlight flash in red
+        images["test_flash"] = encode_image_base64(test_flash_viz)
+
+        # Create composite visualization (for backward compatibility)
         h, w = result.reference_binary.shape
         composite = np.zeros((h * 2, w * 2, 3), dtype=np.uint8)
-        
+
         # Top-left: reference binary
         composite[:h, :w] = cv2.cvtColor(result.reference_binary, cv2.COLOR_GRAY2BGR)
-        
-        # Top-right: test binary
+
+        # Top-right: test binary (aligned)
         composite[:h, w:] = cv2.cvtColor(result.test_binary_aligned, cv2.COLOR_GRAY2BGR)
-        
-        # Bottom-left: flash mask highlighted
-        flash_viz = cv2.cvtColor(result.reference_binary, cv2.COLOR_GRAY2BGR)
-        flash_viz[result.flash_mask > 0] = [0, 0, 255]
-        composite[h:, :w] = flash_viz
-        
-        # Bottom-right: overlay
+
+        # Bottom-left: test + flash
+        composite[h:, :w] = test_flash_viz
+
+        # Bottom-right: overlay (green=ref, red=test, yellow=match, bright red=flash)
         composite[h:, w:] = result.overlay_image
-        
+
         # Resize for web display
         scale = min(1200 / composite.shape[1], 900 / composite.shape[0])
         if scale < 1:
             composite = cv2.resize(composite, None, fx=scale, fy=scale)
-        
+
         images["composite"] = encode_image_base64(composite)
         
         return jsonify({

@@ -35,12 +35,14 @@ class DetectionParams:
     roi_margin: int = 10  # pixels to shrink from detected circle
     
     # Alignment
-    alignment_method: str = "sift"  # "sift", "orb", "none"
+    alignment_method: str = "sift"  # "sift", "orb", "ecc", "none"
     ransac_threshold: float = 5.0
+    max_iterations: int = 1000  # For ECC alignment
     
     # Flash detection
     min_flash_area: int = 100  # minimum pixels to count as flash
-    
+    invert_binary: bool = False  # Invert binary after thresholding (if openings are dark)
+
     # Use reference threshold for test image
     use_reference_threshold: bool = True
     
@@ -316,13 +318,59 @@ class FlashDetector:
         mask = (dist_from_center <= radius).astype(np.uint8) * 255
         
         return mask, center, radius
-    
-    def _align_images(self, ref: np.ndarray, test: np.ndarray, 
+
+    def _align_ecc(self, ref: np.ndarray, test: np.ndarray,
+                   params: DetectionParams) -> Tuple[np.ndarray, Dict]:
+        """Align images using ECC (Enhanced Correlation Coefficient).
+
+        Better for repetitive patterns like circular grids.
+        """
+        h, w = ref.shape[:2]
+
+        # Define motion model - using Euclidean (rotation + translation)
+        warp_mode = cv2.MOTION_EUCLIDEAN
+        warp_matrix = np.eye(2, 3, dtype=np.float32)
+
+        # Define termination criteria
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                   params.max_iterations, 1e-6)
+
+        try:
+            # Run ECC alignment
+            (cc, warp_matrix) = cv2.findTransformECC(ref, test, warp_matrix,
+                                                     warp_mode, criteria,
+                                                     inputMask=None, gaussFiltSize=5)
+
+            logger.info(f"ECC alignment converged with correlation: {cc:.4f}")
+
+            # Apply transformation
+            aligned = cv2.warpAffine(test, warp_matrix, (w, h),
+                                    flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                                    borderMode=cv2.BORDER_CONSTANT,
+                                    borderValue=0)
+
+            # Extract rotation and translation
+            rotation = np.arctan2(warp_matrix[1, 0], warp_matrix[0, 0]) * 180 / np.pi
+            tx = warp_matrix[0, 2]
+            ty = warp_matrix[1, 2]
+            scale = np.sqrt(warp_matrix[0, 0]**2 + warp_matrix[1, 0]**2)
+
+            return aligned, {"rotation": rotation, "tx": tx, "ty": ty, "scale": scale}
+
+        except cv2.error as e:
+            logger.warning(f"ECC alignment failed: {str(e)}")
+            return test, {"rotation": 0, "tx": 0, "ty": 0, "scale": 1}
+
+    def _align_images(self, ref: np.ndarray, test: np.ndarray,
                       params: DetectionParams) -> Tuple[np.ndarray, Dict]:
         """Align test image to reference using feature matching."""
         if params.alignment_method == "none":
             return test, {"rotation": 0, "tx": 0, "ty": 0, "scale": 1}
-        
+
+        # ECC (Enhanced Correlation Coefficient) - better for repetitive patterns
+        if params.alignment_method == "ecc":
+            return self._align_ecc(ref, test, params)
+
         # Select feature detector
         if params.alignment_method == "sift":
             detector = cv2.SIFT_create(nfeatures=3000)
@@ -334,7 +382,7 @@ class FlashDetector:
         kp2, des2 = detector.detectAndCompute(test, None)
         
         if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
-            logger.warning("Not enough keypoints for alignment")
+            logger.warning(f"Not enough keypoints for alignment: ref={len(kp1) if kp1 else 0}, test={len(kp2) if kp2 else 0}")
             return test, {"rotation": 0, "tx": 0, "ty": 0, "scale": 1}
         
         # Match features
@@ -361,19 +409,25 @@ class FlashDetector:
                     good_matches.append(m)
         
         if len(good_matches) < 10:
-            logger.warning(f"Only {len(good_matches)} good matches found")
+            logger.warning(f"Only {len(good_matches)} good matches found (need at least 10 for homography)")
             return test, {"rotation": 0, "tx": 0, "ty": 0, "scale": 1}
+
+        logger.info(f"Found {len(good_matches)} good matches out of {len(matches)} total matches")
         
         # Get matched points
         src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        
+
         # Find homography (test -> reference)
         H, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, params.ransac_threshold)
-        
+
         if H is None:
             logger.warning("Homography estimation failed")
             return test, {"rotation": 0, "tx": 0, "ty": 0, "scale": 1}
+
+        # Check how many inliers we got
+        inliers = np.sum(mask) if mask is not None else 0
+        logger.info(f"Homography inliers: {inliers}/{len(good_matches)} ({inliers*100/len(good_matches):.1f}%)")
         
         # Apply transform
         h, w = ref.shape[:2]
@@ -389,19 +443,27 @@ class FlashDetector:
     
     def _calculate_metrics(self, ref_binary: np.ndarray, test_binary: np.ndarray,
                            mask: np.ndarray, params: DetectionParams) -> Dict:
-        """Calculate flash detection metrics."""
+        """Calculate flash detection metrics.
+
+        Flash defect logic:
+        - Binary images: WHITE (255) = openings/holes, BLACK (0) = material
+        - Flash = areas where reference is OPEN (white) but test is BLOCKED (black)
+        - This means flash filled the opening that should exist
+        """
         # Apply mask
         ref_masked = np.where(mask > 0, ref_binary, 0)
         test_masked = np.where(mask > 0, test_binary, 0)
-        
-        # Openings (white regions)
+
+        # Openings (white regions = 255)
         ref_openings = ref_masked == 255
         test_openings = test_masked == 255
-        
-        # Flash = reference open but test blocked
+
+        # Flash defect = reference is open (white) but test is blocked (black/not white)
+        # This means the opening got filled with material (flash)
         flash_mask = (ref_openings & ~test_openings).astype(np.uint8) * 255
-        
-        # Extra = test open but reference blocked
+
+        # Extra openings = test is open but reference is blocked
+        # (material was removed, or test has extra holes - usually not flash)
         extra_mask = (~ref_openings & test_openings).astype(np.uint8) * 255
         
         # Filter small flash regions
@@ -438,18 +500,38 @@ class FlashDetector:
     
     def _create_overlay(self, ref_binary: np.ndarray, test_binary: np.ndarray,
                         flash_mask: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
-        """Create visualization overlay."""
+        """Create visualization overlay.
+
+        Color coding (showing MATERIAL, not holes):
+        - Green: Reference has material (test should also have material here)
+        - Red: Test has material (reference should also have material here)
+        - Yellow: Both have material (perfect match)
+        - Black: Both have openings/holes (also good)
+        - Bright Red: Flash defect (reference is open but test has flash material blocking it)
+
+        Note: Binary images have WHITE=openings, BLACK=material
+        So we INVERT them to show material in color channels
+        """
         h, w = ref_binary.shape
         overlay = np.zeros((h, w, 3), dtype=np.uint8)
-        
-        # Green = reference openings, Red = test openings
-        # Yellow = both (good match)
-        overlay[:, :, 1] = np.where(roi_mask > 0, ref_binary, 0)  # Green
-        overlay[:, :, 2] = np.where(roi_mask > 0, test_binary, 0)  # Red
-        
-        # Highlight flash in bright red
-        overlay[flash_mask > 0] = [0, 0, 255]
-        
+
+        # Apply ROI mask to both binaries
+        ref_masked = np.where(roi_mask > 0, ref_binary, 0)
+        test_masked = np.where(roi_mask > 0, test_binary, 0)
+
+        # Invert binaries: now 255 = material, 0 = openings
+        # This way, color channels represent material presence
+        ref_material = 255 - ref_masked
+        test_material = 255 - test_masked
+
+        # Create base overlay (BGR format in OpenCV)
+        overlay[:, :, 1] = ref_material  # Green channel = reference material
+        overlay[:, :, 2] = test_material  # Red channel = test material
+
+        # Flash defects: reference is OPEN (no material) but test is BLOCKED (has material)
+        # Highlight these in bright red
+        overlay[flash_mask > 0] = [0, 0, 255]  # BGR: bright red flash defect
+
         return overlay
 
 
