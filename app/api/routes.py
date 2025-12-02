@@ -18,6 +18,7 @@ api = Blueprint('api', __name__)
 # Global detector instance
 detector = FlashDetector()
 current_params = DetectionParams()
+original_reference_image = None  # Store original unrotated reference for rotation
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif'}
 
@@ -78,14 +79,14 @@ def reset_params():
 @api.route('/reference', methods=['POST'])
 def upload_reference():
     """Upload reference (golden) image."""
-    global detector, current_params
-    
+    global detector, current_params, original_reference_image
+
     # Check for file upload
     if 'file' in request.files:
         file = request.files['file']
         if file.filename == '':
             return jsonify({"error": "No file selected"}), 400
-        
+
         if file and allowed_file(file.filename):
             # Read image from file
             file_bytes = file.read()
@@ -93,7 +94,7 @@ def upload_reference():
             image = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
         else:
             return jsonify({"error": "Invalid file type"}), 400
-    
+
     # Check for base64 image
     elif request.is_json and 'image' in request.get_json():
         data = request.get_json()
@@ -103,17 +104,20 @@ def upload_reference():
             return jsonify({"error": f"Failed to decode image: {str(e)}"}), 400
     else:
         return jsonify({"error": "No image provided"}), 400
-    
+
     if image is None:
         return jsonify({"error": "Failed to load image"}), 400
-    
+
     try:
+        # Store original unrotated reference image for rotation operations
+        original_reference_image = image.copy()
+
         # Set reference image
         info = detector.set_reference(image, current_params)
-        
+
         # Get binary preview
         binary_preview = encode_image_base64(detector.reference_binary)
-        
+
         return jsonify({
             "status": "success",
             "info": {
@@ -249,27 +253,145 @@ def detect_flash():
         return jsonify({"error": str(e)}), 500
 
 
+@api.route('/reference/rotate', methods=['POST'])
+def rotate_reference():
+    """Rotate the reference image by specified angle."""
+    global detector, current_params, original_reference_image
+
+    if original_reference_image is None:
+        return jsonify({"error": "No reference image set"}), 400
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON data provided"}), 400
+
+    angle = data.get('angle', 0)
+
+    try:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"=== ROTATION REQUEST ===")
+        logger.info(f"Requested angle: {angle} degrees")
+        logger.info(f"Original image exists: {original_reference_image is not None}")
+        logger.info(f"Original image shape: {original_reference_image.shape if original_reference_image is not None else 'None'}")
+
+        # Save original before rotation for comparison
+        orig_debug_path = os.path.join("/tmp/flash_detector_debug", f"original_before_rotation_{angle}.png")
+        os.makedirs("/tmp/flash_detector_debug", exist_ok=True)
+        cv2.imwrite(orig_debug_path, original_reference_image)
+        logger.info(f"Saved original (before rotation) to: {orig_debug_path}")
+
+        # Always rotate from the ORIGINAL unrotated reference image
+        h, w = original_reference_image.shape[:2]
+        center = (w // 2, h // 2)
+
+        # Create rotation matrix
+        # NOTE: OpenCV rotation is COUNTER-CLOCKWISE for positive angles
+        M = cv2.getRotationMatrix2D(center, angle, scale=1.0)
+        logger.info(f"Rotation matrix center: {center}")
+        logger.info(f"Original image dimensions: {w}x{h}")
+
+        # Calculate expanded canvas to fit entire rotated image
+        cos = np.abs(M[0, 0])
+        sin = np.abs(M[0, 1])
+        new_w = int((h * sin) + (w * cos))
+        new_h = int((h * cos) + (w * sin))
+
+        # Adjust rotation matrix to center the image in expanded canvas
+        M[0, 2] += (new_w / 2) - center[0]
+        M[1, 2] += (new_h / 2) - center[1]
+
+        logger.info(f"Expanded canvas for rotation: {new_w}x{new_h}")
+
+        # Rotate with expanded canvas (no cropping)
+        rotated = cv2.warpAffine(
+            original_reference_image, M, (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255  # White background
+        )
+
+        logger.info(f"Rotated image shape: {rotated.shape}")
+        logger.info(f"Rotated image min/max values: {rotated.min()}/{rotated.max()}")
+
+        # Re-process with rotated image (this updates detector.reference_image)
+        info = detector.set_reference(rotated, current_params)
+
+        logger.info(f"Detector updated with rotated image")
+        logger.info(f"New threshold: {info['threshold']}")
+
+        # Save rotated images to disk for debugging
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_dir = "/tmp/flash_detector_debug"
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # Save the rotated grayscale image
+        rotated_path = os.path.join(debug_dir, f"rotated_grayscale_{timestamp}_angle{angle}.png")
+        cv2.imwrite(rotated_path, rotated)
+
+        # Save the rotated binary image
+        binary_path = os.path.join(debug_dir, f"rotated_binary_{timestamp}_angle{angle}.png")
+        cv2.imwrite(binary_path, detector.reference_binary)
+
+        logger.info(f"Saved rotated grayscale to: {rotated_path}")
+        logger.info(f"Saved rotated binary to: {binary_path}")
+        logger.info(f"=== ROTATION COMPLETE ===")
+
+        # Get previews
+        binary_preview = encode_image_base64(detector.reference_binary)
+        original_preview = encode_image_base64(rotated)
+
+        # Save what we're sending to frontend for debugging
+        sent_binary_path = os.path.join(debug_dir, f"sent_to_frontend_binary_{timestamp}_angle{angle}.png")
+        cv2.imwrite(sent_binary_path, detector.reference_binary)
+        logger.info(f"Saved binary being sent to frontend: {sent_binary_path}")
+
+        # Create ROI visualization
+        roi_viz = cv2.cvtColor(rotated, cv2.COLOR_GRAY2BGR)
+        if detector.roi_center and detector.roi_radius:
+            cv2.circle(roi_viz, detector.roi_center, detector.roi_radius, (0, 255, 0), 2)
+        roi_preview = encode_image_base64(roi_viz)
+
+        return jsonify({
+            "status": "success",
+            "angle": angle,
+            "info": {
+                "threshold": info["threshold"],
+                "roi_center": list(info["roi_center"]),
+                "roi_radius": info["roi_radius"],
+            },
+            "original": original_preview,
+            "binary": binary_preview,
+            "roi": roi_preview,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @api.route('/batch', methods=['POST'])
 def batch_detect():
     """Run batch detection on multiple test images."""
     global detector, current_params
-    
+
     if detector.reference_image is None:
         return jsonify({"error": "No reference image set"}), 400
-    
+
     if 'files' not in request.files:
         return jsonify({"error": "No files provided"}), 400
-    
+
     files = request.files.getlist('files')
     results = []
-    
+
     for file in files:
         if file and allowed_file(file.filename):
             try:
                 file_bytes = file.read()
                 nparr = np.frombuffer(file_bytes, np.uint8)
                 image = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-                
+
                 if image is not None:
                     result = detector.detect(image, current_params)
                     results.append({
@@ -282,7 +404,7 @@ def batch_detect():
                     "filename": secure_filename(file.filename),
                     "error": str(e),
                 })
-    
+
     return jsonify({
         "status": "success",
         "count": len(results),
