@@ -332,21 +332,23 @@
             );
         }
 
-        // Grid Overlay Component (8x8 grid)
-        function GridOverlay({ show }) {
+        // Grid Overlay Component (dynamic grid size)
+        function GridOverlay({ show, gridSize = 8 }) {
             if (!show) return null;
 
             const lines = [];
-            // Vertical lines (every 12.5% for 8x8 grid)
-            for (let i = 1; i < 8; i++) {
-                const pos = (i * 12.5);
+            const spacing = 100 / gridSize; // Calculate spacing percentage
+
+            // Vertical lines
+            for (let i = 1; i < gridSize; i++) {
+                const pos = (i * spacing);
                 lines.push(
                     <div key={`v${i}`} className="grid-line-v" style={{left: `${pos}%`}}></div>
                 );
             }
-            // Horizontal lines (every 12.5% for 8x8 grid)
-            for (let i = 1; i < 8; i++) {
-                const pos = (i * 12.5);
+            // Horizontal lines
+            for (let i = 1; i < gridSize; i++) {
+                const pos = (i * spacing);
                 lines.push(
                     <div key={`h${i}`} className="grid-line-h" style={{top: `${pos}%`}}></div>
                 );
@@ -361,7 +363,7 @@
         }
 
         // Image Display Component
-        function ImageDisplay({ label, imageSrc, onUpload, uploadLabel, showRotationControls, rotation, onRotationChange, onRotationApply }) {
+        function ImageDisplay({ label, imageSrc, onUpload, uploadLabel, showRotationControls, rotation, onRotationChange, onRotationApply, gridSize, onGridSizeChange }) {
             const [dragOver, setDragOver] = useState(false);
             const [uploading, setUploading] = useState(false);
             const [showGrid, setShowGrid] = useState(false);
@@ -413,9 +415,16 @@
 
                     {/* Rotation Controls */}
                     {showRotationControls && imageSrc && (
-                        <div className="p-2 bg-gray-50 border-b border-gray-200">
+                        <div className="p-2 bg-gray-50 border-b border-gray-200 space-y-2">
                             <div className="flex items-center gap-2">
                                 <label className="text-xs font-medium text-gray-700 whitespace-nowrap">Rotate:</label>
+                                <button
+                                    onClick={() => onRotationChange && onRotationChange((rotation || 0) - 1)}
+                                    className="text-xs bg-blue-100 hover:bg-blue-200 text-blue-700 px-2 py-1 rounded font-bold"
+                                    title="Rotate -1°"
+                                >
+                                    -1°
+                                </button>
                                 <input
                                     type="range"
                                     min="-180"
@@ -425,6 +434,13 @@
                                     onChange={(e) => onRotationChange && onRotationChange(parseFloat(e.target.value))}
                                     className="flex-1"
                                 />
+                                <button
+                                    onClick={() => onRotationChange && onRotationChange((rotation || 0) + 1)}
+                                    className="text-xs bg-blue-100 hover:bg-blue-200 text-blue-700 px-2 py-1 rounded font-bold"
+                                    title="Rotate +1°"
+                                >
+                                    +1°
+                                </button>
                                 <span className="text-xs text-purple-600 font-medium w-12 text-right">{rotation || 0}°</span>
                                 <button
                                     onClick={() => onRotationApply && onRotationApply()}
@@ -438,6 +454,19 @@
                                 >
                                     Reset
                                 </button>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <label className="text-xs font-medium text-gray-700 whitespace-nowrap">Grid:</label>
+                                <input
+                                    type="range"
+                                    min="2"
+                                    max="20"
+                                    step="1"
+                                    value={gridSize || 8}
+                                    onChange={(e) => onGridSizeChange && onGridSizeChange(parseInt(e.target.value))}
+                                    className="flex-1"
+                                />
+                                <span className="text-xs text-blue-600 font-medium w-12 text-right">{gridSize || 8}x{gridSize || 8}</span>
                             </div>
                         </div>
                     )}
@@ -475,7 +504,7 @@
                                         objectFit: 'contain'
                                     }}
                                 />
-                                <GridOverlay show={showGrid} />
+                                <GridOverlay show={showGrid} gridSize={gridSize} />
                             </div>
                         ) : (
                             <div className="text-center text-gray-400">
@@ -598,8 +627,8 @@
         // Main App Component
         function App() {
             const [params, setParams] = useState({
-                threshold_method: "otsu",
-                manual_threshold: 128,
+                threshold_method: "manual",
+                manual_threshold: 119,
                 adaptive_block_size: 51,
                 adaptive_c: 5,
                 morph_enabled: true,
@@ -610,8 +639,8 @@
                 roi_margin: 10,
                 use_reference_threshold: true,
                 min_flash_area: 100,
-                alignment_method: "sift",
-                ransac_threshold: 5.0
+                alignment_method: "orb",
+                ransac_threshold: 5.5
             });
 
             const [referencePreview, setReferencePreview] = useState(null);
@@ -627,6 +656,7 @@
             const [appliedRotation, setAppliedRotation] = useState(0);
             const [isApplyingRotation, setIsApplyingRotation] = useState(false);
             const [previewVersion, setPreviewVersion] = useState(0);
+            const [gridSize, setGridSize] = useState(8); // Grid divisions (8x8 by default)
 
             // Load initial params from server
             useEffect(() => {
@@ -988,6 +1018,8 @@
                                 rotation={referenceRotation}
                                 onRotationChange={setReferenceRotation}
                                 onRotationApply={applyReferenceRotation}
+                                gridSize={gridSize}
+                                onGridSizeChange={setGridSize}
                             />
                             <ImageDisplay
                                 label="Test Image (To Inspect)"
