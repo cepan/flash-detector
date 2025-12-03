@@ -6,7 +6,7 @@ by comparing test images against a golden reference sample.
 """
 
 import os
-from flask import Flask, send_from_directory
+from flask import Flask, send_from_directory, make_response
 from flask_cors import CORS
 
 def create_app(config=None):
@@ -34,11 +34,23 @@ def create_app(config=None):
     # Register API blueprint
     from .api import api
     app.register_blueprint(api, url_prefix='/api')
-    
-    # Serve index.html at root
+
+    # Auto-load saved reference on startup (if exists)
+    with app.app_context():
+        try:
+            from .api.routes import load_saved_reference_on_startup
+            load_saved_reference_on_startup()
+        except Exception as e:
+            print(f"Could not auto-load saved reference: {e}")
+
+    # Serve index.html at root (with no-cache headers)
     @app.route('/')
     def index():
-        return send_from_directory(app.static_folder, 'index.html')
+        response = make_response(send_from_directory(app.static_folder, 'index.html'))
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
     
     # Serve other static files
     @app.route('/<path:path>')

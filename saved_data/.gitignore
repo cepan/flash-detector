@@ -1,0 +1,8 @@
+# Ignore saved reference images and config
+*.png
+*.jpg
+*.jpeg
+*.json
+
+# But keep this .gitignore file
+!.gitignore

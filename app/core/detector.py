@@ -8,7 +8,7 @@ in industrial parts by comparing test images against a golden reference.
 import cv2
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ class DetectionParams:
     """Parameters for flash detection algorithm."""
     
     # Binarization parameters
-    threshold_method: str = "otsu"  # "otsu", "manual", "adaptive"
+    threshold_method: str = "manual"  # "otsu", "manual", "adaptive"
     manual_threshold: int = 128
     adaptive_block_size: int = 51
     adaptive_c: int = 5
@@ -35,8 +35,8 @@ class DetectionParams:
     roi_margin: int = 10  # pixels to shrink from detected circle
     
     # Alignment
-    alignment_method: str = "sift"  # "sift", "orb", "ecc", "none"
-    ransac_threshold: float = 5.0
+    alignment_method: str = "orb"  # "sift", "orb", "ecc", "none"
+    ransac_threshold: float = 5.5
     max_iterations: int = 1000  # For ECC alignment
     
     # Flash detection
@@ -45,6 +45,10 @@ class DetectionParams:
 
     # Use reference threshold for test image
     use_reference_threshold: bool = True
+
+    # Per-hole analysis
+    analyze_individual_holes: bool = True  # Enable per-hole flash detection
+    min_hole_area: int = 50  # Minimum area (pixels) to count as a hole
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert parameters to dictionary."""
@@ -63,6 +67,8 @@ class DetectionParams:
             "ransac_threshold": self.ransac_threshold,
             "min_flash_area": self.min_flash_area,
             "use_reference_threshold": self.use_reference_threshold,
+            "analyze_individual_holes": self.analyze_individual_holes,
+            "min_hole_area": self.min_hole_area,
         }
     
     @classmethod
@@ -74,7 +80,7 @@ class DetectionParams:
 @dataclass
 class DetectionResult:
     """Results from flash detection."""
-    
+
     # Metrics
     flash_percentage: float = 0.0
     flash_pixels: int = 0
@@ -82,25 +88,29 @@ class DetectionResult:
     test_opening_pixels: int = 0
     iou: float = 0.0
     extra_pixels: int = 0
-    
+
     # Alignment info
     rotation_degrees: float = 0.0
     translation_x: float = 0.0
     translation_y: float = 0.0
     scale: float = 1.0
-    
+
     # Threshold used
     threshold_value: float = 0.0
-    
+
+    # Per-hole details (optional)
+    hole_details: Optional[List[Dict[str, Any]]] = None
+    labeled_overlay: Optional[np.ndarray] = None
+
     # Images (as numpy arrays)
     reference_binary: Optional[np.ndarray] = None
     test_binary_aligned: Optional[np.ndarray] = None
     flash_mask: Optional[np.ndarray] = None
     overlay_image: Optional[np.ndarray] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert results to dictionary (without images)."""
-        return {
+        result = {
             "flash_percentage": round(self.flash_percentage, 2),
             "flash_pixels": self.flash_pixels,
             "reference_opening_pixels": self.reference_opening_pixels,
@@ -113,6 +123,12 @@ class DetectionResult:
             "scale": round(self.scale, 4),
             "threshold_value": round(self.threshold_value, 1),
         }
+
+        # Include hole details if available
+        if self.hole_details is not None:
+            result["hole_details"] = self.hole_details
+
+        return result
 
 
 class FlashDetector:
@@ -236,14 +252,24 @@ class FlashDetector:
         metrics = self._calculate_metrics(
             self.reference_binary, test_binary, self.roi_mask, params
         )
-        
+
         result.flash_percentage = metrics["flash_percentage"]
         result.flash_pixels = metrics["flash_pixels"]
         result.reference_opening_pixels = metrics["ref_openings"]
         result.test_opening_pixels = metrics["test_openings"]
         result.iou = metrics["iou"]
         result.extra_pixels = metrics["extra_pixels"]
-        
+
+        # Per-hole analysis (if enabled)
+        if params.analyze_individual_holes:
+            result.hole_details = self._detect_individual_holes(
+                self.reference_binary, test_binary, self.roi_mask, params
+            )
+            result.labeled_overlay = self._create_labeled_overlay(
+                self.reference_binary, test_binary, metrics["flash_mask"],
+                self.roi_mask, result.hole_details
+            )
+
         # Store images
         result.reference_binary = self.reference_binary
         result.test_binary_aligned = test_binary
@@ -251,7 +277,7 @@ class FlashDetector:
         result.overlay_image = self._create_overlay(
             self.reference_binary, test_binary, metrics["flash_mask"], self.roi_mask
         )
-        
+
         return result
     
     def _binarize(self, image: np.ndarray, params: DetectionParams) -> Tuple[np.ndarray, float]:
@@ -498,6 +524,144 @@ class FlashDetector:
             "flash_mask": flash_mask,
         }
     
+    def _detect_individual_holes(self, ref_binary: np.ndarray, test_binary: np.ndarray,
+                                  mask: np.ndarray, params: DetectionParams) -> List[Dict[str, Any]]:
+        """Detect and analyze individual holes.
+
+        Args:
+            ref_binary: Reference binary image (WHITE=openings)
+            test_binary: Test binary image (WHITE=openings)
+            mask: ROI mask
+            params: Detection parameters
+
+        Returns:
+            List of dictionaries containing hole details
+        """
+        # Apply mask to reference
+        ref_masked = np.where(mask > 0, ref_binary, 0)
+
+        # Find contours of holes (white regions = openings)
+        contours, _ = cv2.findContours(ref_masked, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        hole_details = []
+
+        for idx, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+
+            # Skip small holes
+            if area < params.min_hole_area:
+                continue
+
+            # Get bounding info
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+
+            # Create mask for this specific hole
+            hole_mask = np.zeros_like(ref_binary)
+            cv2.drawContours(hole_mask, [contour], -1, 255, -1)
+
+            # Count pixels for this hole in both images
+            ref_opening_pixels = np.sum(hole_mask == 255)
+            test_opening_pixels = np.sum((hole_mask == 255) & (test_binary == 255))
+
+            # Flash = reference is open but test is blocked
+            flash_pixels = ref_opening_pixels - test_opening_pixels
+            flash_percentage = (flash_pixels / ref_opening_pixels * 100) if ref_opening_pixels > 0 else 0
+
+            # Determine status
+            if flash_percentage < 5:
+                status = "Good"
+            elif flash_percentage < 25:
+                status = "Minor Flash"
+            else:
+                status = "Flash Defect"
+
+            hole_details.append({
+                "hole_id": idx + 1,
+                "center_x": cx,
+                "center_y": cy,
+                "area": int(area),
+                "flash_pixels": int(flash_pixels),
+                "flash_percentage": round(flash_percentage, 2),
+                "status": status
+            })
+
+        # Sort by hole ID
+        hole_details.sort(key=lambda x: x["hole_id"])
+
+        return hole_details
+
+    def _create_labeled_overlay(self, ref_binary: np.ndarray, test_binary: np.ndarray,
+                                 flash_mask: np.ndarray, roi_mask: np.ndarray,
+                                 hole_details: List[Dict[str, Any]]) -> np.ndarray:
+        """Create visualization overlay with hole labels.
+
+        Args:
+            ref_binary: Reference binary image
+            test_binary: Test binary image
+            flash_mask: Flash defect mask
+            roi_mask: ROI mask
+            hole_details: List of hole information
+
+        Returns:
+            Labeled overlay image (BGR)
+        """
+        # Create base overlay
+        overlay = self._create_overlay(ref_binary, test_binary, flash_mask, roi_mask)
+
+        # Add hole labels with larger, more visible text
+        for hole in hole_details:
+            cx, cy = hole["center_x"], hole["center_y"]
+            hole_id = hole["hole_id"]
+            flash_pct = hole["flash_percentage"]
+
+            # Determine label color based on status (softer, eye-friendly colors)
+            if hole["status"] == "Good":
+                color = (100, 180, 120)  # Soft teal/green (BGR)
+            elif hole["status"] == "Minor Flash":
+                color = (100, 180, 255)  # Soft orange/peach (BGR)
+            else:
+                color = (120, 100, 255)  # Soft red/salmon (BGR)
+
+            # Draw larger circle
+            cv2.circle(overlay, (cx, cy), 6, color, -1)
+
+            # Add label with larger font and white background
+            label = f"{hole_id}"
+            font_scale = 1.0
+            thickness = 3
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            # Get text size for background box
+            (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+            # Position text to the right of the circle
+            text_x = cx + 10
+            text_y = cy + 7
+
+            # Draw white background rectangle with proper wrapping
+            # Fix: Account for baseline properly to fully wrap the text
+            padding = 4  # Increased padding for better coverage
+            box_top = text_y - text_h - baseline - padding
+            box_bottom = text_y + baseline + padding
+            box_left = text_x - padding
+            box_right = text_x + text_w + padding
+
+            cv2.rectangle(overlay,
+                         (box_left, box_top),
+                         (box_right, box_bottom),
+                         (255, 255, 255), -1)
+
+            # Draw text with softer colored outline
+            cv2.putText(overlay, label, (text_x, text_y),
+                       font, font_scale, color, thickness)
+
+        return overlay
+
     def _create_overlay(self, ref_binary: np.ndarray, test_binary: np.ndarray,
                         flash_mask: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
         """Create visualization overlay.
@@ -524,13 +688,18 @@ class FlashDetector:
         ref_material = 255 - ref_masked
         test_material = 255 - test_masked
 
+        # Reduce intensity for softer, eye-friendly colors
+        # Scale from 0-255 to 0-180 for less eye strain
+        ref_material = (ref_material * 0.7).astype(np.uint8)  # Max 180 instead of 255
+        test_material = (test_material * 0.7).astype(np.uint8)  # Max 180 instead of 255
+
         # Create base overlay (BGR format in OpenCV)
-        overlay[:, :, 1] = ref_material  # Green channel = reference material
-        overlay[:, :, 2] = test_material  # Red channel = test material
+        overlay[:, :, 1] = ref_material  # Green channel = reference material (softer)
+        overlay[:, :, 2] = test_material  # Red channel = test material (softer)
 
         # Flash defects: reference is OPEN (no material) but test is BLOCKED (has material)
-        # Highlight these in bright red
-        overlay[flash_mask > 0] = [0, 0, 255]  # BGR: bright red flash defect
+        # Highlight these in softer red that's easier on the eyes
+        overlay[flash_mask > 0] = [100, 120, 240]  # BGR: soft red/salmon flash defect
 
         return overlay
 

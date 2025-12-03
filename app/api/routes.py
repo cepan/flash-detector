@@ -9,6 +9,8 @@ import os
 import cv2
 import numpy as np
 import base64
+import json
+from datetime import datetime
 from flask import Blueprint, request, jsonify, current_app
 from werkzeug.utils import secure_filename
 from ..core import FlashDetector, DetectionParams
@@ -19,12 +21,65 @@ api = Blueprint('api', __name__)
 detector = FlashDetector()
 current_params = DetectionParams()
 original_reference_image = None  # Store original unrotated reference for rotation
+saved_rotation_angle = 0  # Store the applied rotation angle
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif'}
+
+# Saved data paths
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SAVED_DATA_DIR = os.path.join(PROJECT_ROOT, 'saved_data')
+SAVED_REFERENCE_PATH = os.path.join(SAVED_DATA_DIR, 'reference_original.png')  # Original unrotated
+SAVED_REFERENCE_ROTATED_PATH = os.path.join(SAVED_DATA_DIR, 'reference_rotated.png')  # After rotation
+SAVED_CONFIG_PATH = os.path.join(SAVED_DATA_DIR, 'reference_config.json')
 
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def load_saved_reference_on_startup():
+    """Load saved reference on application startup if it exists."""
+    global original_reference_image, saved_rotation_angle, detector, current_params
+
+    if not os.path.exists(SAVED_REFERENCE_PATH) or not os.path.exists(SAVED_CONFIG_PATH):
+        print("No saved reference found. Starting fresh.")
+        return
+
+    try:
+        # Load configuration
+        with open(SAVED_CONFIG_PATH, 'r') as f:
+            config = json.load(f)
+
+        # Load original image
+        original_image = cv2.imread(SAVED_REFERENCE_PATH, cv2.IMREAD_GRAYSCALE)
+        if original_image is None:
+            print("Failed to load saved reference image.")
+            return
+
+        original_reference_image = original_image
+        saved_rotation_angle = config.get("rotation_angle", 0)
+
+        # Try to load the pre-rotated image first (faster!)
+        if os.path.exists(SAVED_REFERENCE_ROTATED_PATH):
+            rotated = cv2.imread(SAVED_REFERENCE_ROTATED_PATH, cv2.IMREAD_GRAYSCALE)
+            if rotated is not None:
+                print(f"✓ Loaded pre-rotated reference image")
+            else:
+                # Fallback: calculate rotation
+                rotated = original_image
+        else:
+            # No rotated image saved, use original
+            rotated = original_image
+
+        # Set reference in detector
+        detector.set_reference(rotated, current_params)
+
+        print(f"✓ Auto-loaded saved reference (rotation: {saved_rotation_angle}°)")
+        print(f"  Timestamp: {config.get('upload_timestamp', 'unknown')}")
+        print(f"  Image shape: {config.get('image_shape', 'unknown')}")
+
+    except Exception as e:
+        print(f"Error loading saved reference: {e}")
 
 
 def encode_image_base64(image: np.ndarray, format: str = '.png') -> str:
@@ -111,12 +166,36 @@ def upload_reference():
     try:
         # Store original unrotated reference image for rotation operations
         original_reference_image = image.copy()
+        saved_rotation_angle = 0  # Reset rotation angle when new image uploaded
 
         # Set reference image
         info = detector.set_reference(image, current_params)
 
         # Get binary preview
         binary_preview = encode_image_base64(detector.reference_binary)
+
+        # Auto-save reference when uploaded
+        try:
+            os.makedirs(SAVED_DATA_DIR, exist_ok=True)
+            cv2.imwrite(SAVED_REFERENCE_PATH, original_reference_image)
+
+            # Save rotated version (same as original on first upload)
+            cv2.imwrite(SAVED_REFERENCE_ROTATED_PATH, original_reference_image)
+
+            config = {
+                "rotation_angle": 0,
+                "upload_timestamp": datetime.now().isoformat(),
+                "image_shape": list(original_reference_image.shape),
+                "rotated_image_shape": list(original_reference_image.shape),
+                "threshold": float(detector.reference_threshold) if detector.reference_threshold else None,
+                "params": current_params.to_dict()
+            }
+
+            with open(SAVED_CONFIG_PATH, 'w') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            # Don't fail the upload if save fails
+            pass
 
         return jsonify({
             "status": "success",
@@ -204,7 +283,7 @@ def detect_flash():
     try:
         # Run detection
         result = detector.detect(image, current_params)
-        
+
         # Encode result images
         images = {
             "reference_binary": encode_image_base64(result.reference_binary),
@@ -212,7 +291,11 @@ def detect_flash():
             "flash_mask": encode_image_base64(result.flash_mask),
             "overlay": encode_image_base64(result.overlay_image),
         }
-        
+
+        # Add labeled overlay if hole analysis was performed
+        if result.labeled_overlay is not None:
+            images["labeled_overlay"] = encode_image_base64(result.labeled_overlay)
+
         # Create test + flash visualization
         # Show test binary with flash defects highlighted in red
         test_flash_viz = cv2.cvtColor(result.test_binary_aligned, cv2.COLOR_GRAY2BGR)
@@ -241,7 +324,7 @@ def detect_flash():
             composite = cv2.resize(composite, None, fx=scale, fy=scale)
 
         images["composite"] = encode_image_base64(composite)
-        
+
         return jsonify({
             "status": "success",
             "result": result.to_dict(),
@@ -256,7 +339,7 @@ def detect_flash():
 @api.route('/reference/rotate', methods=['POST'])
 def rotate_reference():
     """Rotate the reference image by specified angle."""
-    global detector, current_params, original_reference_image
+    global detector, current_params, original_reference_image, saved_rotation_angle
 
     if original_reference_image is None:
         return jsonify({"error": "No reference image set"}), 400
@@ -266,6 +349,7 @@ def rotate_reference():
         return jsonify({"error": "No JSON data provided"}), 400
 
     angle = data.get('angle', 0)
+    saved_rotation_angle = angle  # Store the rotation angle
 
     try:
         import logging
@@ -353,6 +437,33 @@ def rotate_reference():
             cv2.circle(roi_viz, detector.roi_center, detector.roi_radius, (0, 255, 0), 2)
         roi_preview = encode_image_base64(roi_viz)
 
+        # Auto-save reference, rotated image, and config
+        try:
+            os.makedirs(SAVED_DATA_DIR, exist_ok=True)
+
+            # Save original (unrotated) image
+            cv2.imwrite(SAVED_REFERENCE_PATH, original_reference_image)
+
+            # Save rotated image for faster loading
+            cv2.imwrite(SAVED_REFERENCE_ROTATED_PATH, rotated)
+
+            config = {
+                "rotation_angle": saved_rotation_angle,
+                "upload_timestamp": datetime.now().isoformat(),
+                "image_shape": list(original_reference_image.shape),
+                "rotated_image_shape": list(rotated.shape),
+                "threshold": float(detector.reference_threshold) if detector.reference_threshold else None,
+                "params": current_params.to_dict()
+            }
+
+            with open(SAVED_CONFIG_PATH, 'w') as f:
+                json.dump(config, f, indent=2)
+
+            logger.info(f"Auto-saved reference with rotation angle: {saved_rotation_angle}")
+            logger.info(f"Saved rotated image: {SAVED_REFERENCE_ROTATED_PATH}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-save reference: {str(e)}")
+
         return jsonify({
             "status": "success",
             "angle": angle,
@@ -364,6 +475,7 @@ def rotate_reference():
             "original": original_preview,
             "binary": binary_preview,
             "roi": roi_preview,
+            "saved": True  # Indicate that it was auto-saved
         })
     except Exception as e:
         import traceback
@@ -409,4 +521,114 @@ def batch_detect():
         "status": "success",
         "count": len(results),
         "results": results,
+    })
+
+
+@api.route('/reference/save', methods=['POST'])
+def save_reference():
+    """Save current reference image and configuration to disk."""
+    global original_reference_image, saved_rotation_angle, detector, current_params
+
+    if original_reference_image is None:
+        return jsonify({"error": "No reference image to save"}), 400
+
+    try:
+        # Ensure saved_data directory exists
+        os.makedirs(SAVED_DATA_DIR, exist_ok=True)
+
+        # Save the original (unrotated) reference image
+        cv2.imwrite(SAVED_REFERENCE_PATH, original_reference_image)
+
+        # Save configuration
+        config = {
+            "rotation_angle": saved_rotation_angle,
+            "upload_timestamp": datetime.now().isoformat(),
+            "image_shape": list(original_reference_image.shape),
+            "threshold": float(detector.reference_threshold) if detector.reference_threshold else None,
+            "params": current_params.to_dict()
+        }
+
+        with open(SAVED_CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+
+        return jsonify({
+            "status": "success",
+            "message": "Reference saved successfully",
+            "config": config
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@api.route('/reference/load', methods=['POST'])
+def load_reference():
+    """Load saved reference image and configuration from disk."""
+    global original_reference_image, saved_rotation_angle, detector, current_params
+
+    if not os.path.exists(SAVED_REFERENCE_PATH) or not os.path.exists(SAVED_CONFIG_PATH):
+        return jsonify({"error": "No saved reference found"}), 404
+
+    try:
+        # Load configuration
+        with open(SAVED_CONFIG_PATH, 'r') as f:
+            config = json.load(f)
+
+        # Load original image
+        original_image = cv2.imread(SAVED_REFERENCE_PATH, cv2.IMREAD_GRAYSCALE)
+        if original_image is None:
+            return jsonify({"error": "Failed to load saved image"}), 500
+
+        original_reference_image = original_image
+        saved_rotation_angle = config.get("rotation_angle", 0)
+
+        # Try to load the pre-rotated image first (faster!)
+        if os.path.exists(SAVED_REFERENCE_ROTATED_PATH):
+            rotated = cv2.imread(SAVED_REFERENCE_ROTATED_PATH, cv2.IMREAD_GRAYSCALE)
+            if rotated is None:
+                # Fallback to original
+                rotated = original_image
+        else:
+            # No rotated image saved, use original
+            rotated = original_image
+
+        # Set reference in detector
+        info = detector.set_reference(rotated, current_params)
+
+        # Get previews
+        binary_preview = encode_image_base64(detector.reference_binary)
+        original_preview = encode_image_base64(rotated)
+
+        return jsonify({
+            "status": "success",
+            "config": config,
+            "info": {
+                "threshold": info["threshold"],
+                "roi_center": list(info["roi_center"]),
+                "roi_radius": info["roi_radius"],
+            },
+            "original": original_preview,
+            "binary": binary_preview,
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@api.route('/reference/status', methods=['GET'])
+def reference_status():
+    """Check if a saved reference exists."""
+    exists = os.path.exists(SAVED_REFERENCE_PATH) and os.path.exists(SAVED_CONFIG_PATH)
+
+    config = None
+    if exists:
+        try:
+            with open(SAVED_CONFIG_PATH, 'r') as f:
+                config = json.load(f)
+        except:
+            pass
+
+    return jsonify({
+        "has_saved_reference": exists,
+        "config": config
     })

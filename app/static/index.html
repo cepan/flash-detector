@@ -3,7 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Flash Detector - Industrial Vision Inspection</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Flash Detector v2.1 - UX Improved (2025-12-02)</title>
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -257,6 +260,17 @@
                 min: 0, max: 1000, step: 10,
                 description: "Minimum pixels to count as flash defect"
             },
+            analyze_individual_holes: {
+                label: "Analyze Individual Holes",
+                type: "checkbox",
+                description: "Enable per-hole flash detection and labeling"
+            },
+            min_hole_area: {
+                label: "Min Hole Area",
+                type: "range",
+                min: 10, max: 500, step: 10,
+                description: "Minimum pixels to count as a hole"
+            },
             alignment_method: {
                 label: "Alignment Method",
                 type: "select",
@@ -281,11 +295,11 @@
             const id = `param-${name}`;
 
             return (
-                <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-1" htmlFor={id}>
+                <div className="mb-5">
+                    <label className="block text-sm font-semibold text-gray-800 mb-2" htmlFor={id}>
                         {config.label}
-                        <span className="text-xs text-gray-500 ml-2">({config.description})</span>
                     </label>
+                    <p className="text-xs text-gray-500 mb-2 break-words">{config.description}</p>
 
                     {config.type === "select" && (
                         <select
@@ -520,8 +534,212 @@
         }
 
         // Results Display Component
+        // Hole Details Table Component
+        function HoleDetailsTable({ holeDetails, selectedHoleId, onHoleSelect }) {
+            const [sortKey, setSortKey] = useState('hole_id');
+            const [sortDesc, setSortDesc] = useState(false);
+            const tableRef = React.useRef(null);
+
+            if (!holeDetails || holeDetails.length === 0) return null;
+
+            // Scroll to selected row when selectedHoleId changes
+            React.useEffect(() => {
+                if (selectedHoleId && tableRef.current) {
+                    const row = tableRef.current.querySelector(`tr[data-hole-id="${selectedHoleId}"]`);
+                    if (row) {
+                        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
+            }, [selectedHoleId]);
+
+            const handleSort = (key) => {
+                if (sortKey === key) {
+                    setSortDesc(!sortDesc);
+                } else {
+                    setSortKey(key);
+                    setSortDesc(false);
+                }
+            };
+
+            const sortedHoles = [...holeDetails].sort((a, b) => {
+                let valA = a[sortKey];
+                let valB = b[sortKey];
+
+                if (typeof valA === 'string') {
+                    return sortDesc ? valB.localeCompare(valA) : valA.localeCompare(valB);
+                }
+
+                return sortDesc ? valB - valA : valA - valB;
+            });
+
+            const getStatusClass = (status) => {
+                if (status === 'Good') return 'text-green-600 bg-green-100';
+                if (status === 'Minor Flash') return 'text-orange-600 bg-orange-100';
+                return 'text-red-600 bg-red-100';
+            };
+
+            const downloadCSV = () => {
+                const headers = ['Hole ID', 'Center X', 'Center Y', 'Area (px)', 'Flash Pixels', 'Flash %', 'Status'];
+                const rows = holeDetails.map(hole => [
+                    hole.hole_id,
+                    hole.center_x,
+                    hole.center_y,
+                    hole.area,
+                    hole.flash_pixels,
+                    hole.flash_percentage.toFixed(2),
+                    hole.status
+                ]);
+
+                const csvContent = [
+                    headers.join(','),
+                    ...rows.map(row => row.join(','))
+                ].join('\n');
+
+                const blob = new Blob([csvContent], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'hole_details.csv';
+                link.click();
+                URL.revokeObjectURL(url);
+            };
+
+            const SortIcon = ({ columnKey }) => {
+                if (sortKey !== columnKey) return <span className="text-gray-400">⇅</span>;
+                return sortDesc ? <span className="text-purple-600">▼</span> : <span className="text-purple-600">▲</span>;
+            };
+
+            return (
+                <div className="card rounded-lg p-4 mt-4">
+                    <div className="flex justify-between items-center mb-3">
+                        <h3 className="text-lg font-semibold text-purple-600">Individual Hole Analysis</h3>
+                        <button
+                            onClick={downloadCSV}
+                            className="text-sm bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded"
+                        >
+                            Export CSV
+                        </button>
+                    </div>
+
+                    <div ref={tableRef} style={{maxHeight: '400px', overflowY: 'auto'}}>
+                        <table className="w-full text-sm border-collapse">
+                            <thead className="bg-gray-100 sticky top-0">
+                                <tr>
+                                    <th className="px-3 py-2 text-left cursor-pointer hover:bg-gray-200" onClick={() => handleSort('hole_id')}>
+                                        Hole ID <SortIcon columnKey="hole_id" />
+                                    </th>
+                                    <th className="px-3 py-2 text-left cursor-pointer hover:bg-gray-200" onClick={() => handleSort('center_x')}>
+                                        Position <SortIcon columnKey="center_x" />
+                                    </th>
+                                    <th className="px-3 py-2 text-right cursor-pointer hover:bg-gray-200" onClick={() => handleSort('area')}>
+                                        Area (px) <SortIcon columnKey="area" />
+                                    </th>
+                                    <th className="px-3 py-2 text-right cursor-pointer hover:bg-gray-200" onClick={() => handleSort('flash_pixels')}>
+                                        Flash Pixels <SortIcon columnKey="flash_pixels" />
+                                    </th>
+                                    <th className="px-3 py-2 text-right cursor-pointer hover:bg-gray-200" onClick={() => handleSort('flash_percentage')}>
+                                        Flash % <SortIcon columnKey="flash_percentage" />
+                                    </th>
+                                    <th className="px-3 py-2 text-center cursor-pointer hover:bg-gray-200" onClick={() => handleSort('status')}>
+                                        Status <SortIcon columnKey="status" />
+                                    </th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {sortedHoles.map(hole => (
+                                    <tr
+                                        key={hole.hole_id}
+                                        data-hole-id={hole.hole_id}
+                                        onClick={() => onHoleSelect && onHoleSelect(hole.hole_id)}
+                                        className={`border-b border-gray-200 cursor-pointer transition-colors ${
+                                            selectedHoleId === hole.hole_id
+                                                ? 'bg-purple-100 hover:bg-purple-200'
+                                                : 'hover:bg-gray-50'
+                                        }`}
+                                    >
+                                        <td className="px-3 py-2 font-medium text-purple-600">{hole.hole_id}</td>
+                                        <td className="px-3 py-2 text-gray-600">({hole.center_x}, {hole.center_y})</td>
+                                        <td className="px-3 py-2 text-right text-gray-900">{hole.area.toLocaleString()}</td>
+                                        <td className="px-3 py-2 text-right text-gray-900">{hole.flash_pixels.toLocaleString()}</td>
+                                        <td className="px-3 py-2 text-right font-medium text-gray-900">{hole.flash_percentage.toFixed(2)}%</td>
+                                        <td className="px-3 py-2 text-center">
+                                            <span className={`px-2 py-1 rounded text-xs font-medium ${getStatusClass(hole.status)}`}>
+                                                {hole.status}
+                                            </span>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div className="mt-3 text-xs text-gray-600">
+                        Total holes detected: {holeDetails.length}
+                    </div>
+                </div>
+            );
+        }
+
         function ResultsDisplay({ result, images }) {
+            const [showHoleLabels, setShowHoleLabels] = useState(true);
+            const [selectedHoleId, setSelectedHoleId] = useState(null);
+            const overlayImageRef = React.useRef(null);
+
             if (!result) return null;
+
+            // Handle clicking on the overlay image to select a hole
+            const handleImageClick = (e) => {
+                if (!result.hole_details || !overlayImageRef.current) return;
+
+                const rect = overlayImageRef.current.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+
+                // Calculate actual image coordinates (accounting for object-fit: contain)
+                const imgNaturalWidth = overlayImageRef.current.naturalWidth;
+                const imgNaturalHeight = overlayImageRef.current.naturalHeight;
+                const displayWidth = rect.width;
+                const displayHeight = rect.height;
+
+                // Calculate scale and offset for object-fit: contain
+                const imgRatio = imgNaturalWidth / imgNaturalHeight;
+                const displayRatio = displayWidth / displayHeight;
+
+                let scale, offsetX = 0, offsetY = 0;
+
+                if (imgRatio > displayRatio) {
+                    // Image is wider - fit to width
+                    scale = displayWidth / imgNaturalWidth;
+                    offsetY = (displayHeight - imgNaturalHeight * scale) / 2;
+                } else {
+                    // Image is taller - fit to height
+                    scale = displayHeight / imgNaturalHeight;
+                    offsetX = (displayWidth - imgNaturalWidth * scale) / 2;
+                }
+
+                // Convert click position to image coordinates
+                const imgX = (x - offsetX) / scale;
+                const imgY = (y - offsetY) / scale;
+
+                // Find closest hole to click position (within 50 pixels)
+                let closestHole = null;
+                let minDistance = 50;
+
+                result.hole_details.forEach(hole => {
+                    const dx = hole.center_x - imgX;
+                    const dy = hole.center_y - imgY;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                        closestHole = hole;
+                    }
+                });
+
+                if (closestHole) {
+                    setSelectedHoleId(closestHole.hole_id);
+                }
+            };
 
             const getFlashClass = (pct) => {
                 if (pct < 5) return 'result-good';
@@ -603,22 +821,59 @@
                                 <div className="p-2 bg-white border-b border-gray-200">
                                     <div className="flex justify-between items-center">
                                         <h4 className="text-sm font-semibold text-purple-600">Overlay</h4>
-                                        <button
-                                            onClick={() => downloadImage(images.overlay, 'overlay.png')}
-                                            className="text-xs bg-purple-100 hover:bg-purple-200 text-purple-700 px-2 py-1 rounded"
-                                        >
-                                            Download
-                                        </button>
+                                        <div className="flex items-center gap-2">
+                                            {/* Toggle for labeled overlay */}
+                                            {images.labeled_overlay && (
+                                                <label className="flex items-center gap-1 text-xs cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={showHoleLabels}
+                                                        onChange={(e) => setShowHoleLabels(e.target.checked)}
+                                                        className="cursor-pointer"
+                                                    />
+                                                    <span className="text-gray-700">Show Hole Labels</span>
+                                                </label>
+                                            )}
+                                            <button
+                                                onClick={() => downloadImage(showHoleLabels && images.labeled_overlay ? images.labeled_overlay : images.overlay, 'overlay.png')}
+                                                className="text-xs bg-purple-100 hover:bg-purple-200 text-purple-700 px-2 py-1 rounded"
+                                            >
+                                                Download
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                                 <div className="flex-1 flex items-center justify-center p-4" style={{height: '350px'}}>
-                                    <img src={`data:image/png;base64,${images.overlay}`} alt="Overlay" style={{width: '100%', height: '100%', objectFit: 'contain'}} />
+                                    <img
+                                        ref={overlayImageRef}
+                                        src={`data:image/png;base64,${showHoleLabels && images.labeled_overlay ? images.labeled_overlay : images.overlay}`}
+                                        alt="Overlay"
+                                        style={{
+                                            width: '100%',
+                                            height: '100%',
+                                            objectFit: 'contain',
+                                            cursor: result.hole_details && showHoleLabels ? 'pointer' : 'default'
+                                        }}
+                                        onClick={showHoleLabels ? handleImageClick : undefined}
+                                    />
                                 </div>
                                 <div className="p-2 bg-gray-50 border-t border-gray-200 text-xs text-gray-600">
                                     Yellow: Material Match | Black: Holes Match | Bright Red: Flash Defect
+                                    {showHoleLabels && images.labeled_overlay && (
+                                        <span> | Green: Good Holes | Orange: Minor Flash | Red: Flash Defect</span>
+                                    )}
                                 </div>
                             </div>
                         </div>
+                    )}
+
+                    {/* Individual Hole Details Table */}
+                    {result.hole_details && result.hole_details.length > 0 && (
+                        <HoleDetailsTable
+                            holeDetails={result.hole_details}
+                            selectedHoleId={selectedHoleId}
+                            onHoleSelect={setSelectedHoleId}
+                        />
                     )}
                 </div>
             );
@@ -640,7 +895,9 @@
                 use_reference_threshold: true,
                 min_flash_area: 100,
                 alignment_method: "orb",
-                ransac_threshold: 5.5
+                ransac_threshold: 5.5,
+                analyze_individual_holes: false,
+                min_hole_area: 50
             });
 
             const [referencePreview, setReferencePreview] = useState(null);
@@ -664,6 +921,42 @@
                     .then(res => res.json())
                     .then(data => setParams(prev => ({ ...prev, ...data })))
                     .catch(err => console.error('Failed to load params:', err));
+            }, []);
+
+            // Check for and load saved reference on page load
+            useEffect(() => {
+                const loadSavedReference = async () => {
+                    try {
+                        // Check if saved reference exists
+                        const statusRes = await fetch(`${API_BASE}/reference/status`);
+                        const statusData = await statusRes.json();
+
+                        if (statusData.has_saved_reference) {
+                            console.log('Found saved reference, loading...');
+
+                            // Get the preview
+                            const previewRes = await fetch(`${API_BASE}/reference/preview`);
+                            const previewData = await previewRes.json();
+
+                            if (previewData.status === 'success') {
+                                setReferencePreview(previewData.binary);
+                                setReferenceInfo(previewData.info);
+                                setHasReference(true);
+                                setReferenceRotation(statusData.config?.rotation_angle || 0);
+                                setAppliedRotation(statusData.config?.rotation_angle || 0);
+
+                                console.log('✓ Loaded saved reference', {
+                                    rotation: statusData.config?.rotation_angle,
+                                    timestamp: statusData.config?.upload_timestamp
+                                });
+                            }
+                        }
+                    } catch (err) {
+                        console.error('Failed to check for saved reference:', err);
+                    }
+                };
+
+                loadSavedReference();
             }, []);
 
             // Update server params when local params change
@@ -923,8 +1216,8 @@
                     <div className="main-layout">
                         {/* Left Panel - Parameters */}
                         <div className="params-panel">
-                            <div className="card rounded-lg p-4 h-full">
-                                <div className="flex justify-between items-center mb-4">
+                            <div className="card rounded-lg p-4 h-full flex flex-col overflow-x-hidden">
+                                <div className="flex justify-between items-center mb-4 flex-shrink-0">
                                     <h2 className="text-xl font-semibold text-purple-600">Parameters</h2>
                                     <button
                                         onClick={resetParams}
@@ -934,74 +1227,117 @@
                                     </button>
                                 </div>
 
-                                <div className="space-y-1 max-h-[70vh] overflow-y-auto pr-2">
-                                    {/* Binarization Section */}
-                                    <h3 className="text-sm font-medium text-gray-700 mb-2 mt-4 border-b border-gray-300 pb-1">
-                                        Binarization
-                                    </h3>
-                                    {['threshold_method', 'manual_threshold', 'adaptive_block_size', 'adaptive_c'].map(name => (
-                                        <ParamControl
-                                            key={name}
-                                            name={name}
-                                            config={PARAM_CONFIG[name]}
-                                            value={params[name]}
-                                            onChange={handleParamChange}
-                                            params={params}
-                                        />
-                                    ))}
+                                <div className="flex-1 overflow-y-auto overflow-x-hidden pr-1 space-y-1">
+                                    {/* Step 1: Binarization */}
+                                    <div className="mb-6">
+                                        <h3 className="text-base font-bold text-gray-800 mb-3 mt-3 pb-2 border-b-2 border-purple-400 bg-purple-50 px-2 py-2 rounded">
+                                            1. Binarization
+                                        </h3>
+                                        <div className="px-1 mt-4">
+                                            {['threshold_method', 'manual_threshold', 'adaptive_block_size', 'adaptive_c'].map(name => (
+                                                <ParamControl
+                                                    key={name}
+                                                    name={name}
+                                                    config={PARAM_CONFIG[name]}
+                                                    value={params[name]}
+                                                    onChange={handleParamChange}
+                                                    params={params}
+                                                />
+                                            ))}
+                                        </div>
+                                    </div>
 
-                                    {/* Morphology Section */}
-                                    <h3 className="text-sm font-medium text-gray-700 mb-2 mt-4 border-b border-gray-300 pb-1">
-                                        Morphology
-                                    </h3>
-                                    {['morph_enabled', 'morph_operation', 'morph_kernel_size', 'morph_iterations'].map(name => (
-                                        <ParamControl
-                                            key={name}
-                                            name={name}
-                                            config={PARAM_CONFIG[name]}
-                                            value={params[name]}
-                                            onChange={handleParamChange}
-                                            params={params}
-                                        />
-                                    ))}
+                                    {/* Step 2: Morphology */}
+                                    <div className="mb-6">
+                                        <h3 className="text-base font-bold text-gray-800 mb-3 mt-3 pb-2 border-b-2 border-purple-400 bg-purple-50 px-2 py-2 rounded">
+                                            2. Morphology
+                                        </h3>
+                                        <div className="px-1 mt-4">
+                                            {['morph_enabled', 'morph_operation', 'morph_kernel_size', 'morph_iterations'].map(name => (
+                                                <ParamControl
+                                                    key={name}
+                                                    name={name}
+                                                    config={PARAM_CONFIG[name]}
+                                                    value={params[name]}
+                                                    onChange={handleParamChange}
+                                                    params={params}
+                                                />
+                                            ))}
+                                        </div>
+                                    </div>
 
-                                    {/* ROI Section */}
-                                    <h3 className="text-sm font-medium text-gray-700 mb-2 mt-4 border-b border-gray-300 pb-1">
-                                        Region of Interest
-                                    </h3>
-                                    {['roi_enabled', 'roi_margin'].map(name => (
-                                        <ParamControl
-                                            key={name}
-                                            name={name}
-                                            config={PARAM_CONFIG[name]}
-                                            value={params[name]}
-                                            onChange={handleParamChange}
-                                            params={params}
-                                        />
-                                    ))}
+                                    {/* Step 3: Region of Interest */}
+                                    <div className="mb-6">
+                                        <h3 className="text-base font-bold text-gray-800 mb-3 mt-3 pb-2 border-b-2 border-purple-400 bg-purple-50 px-2 py-2 rounded">
+                                            3. Region of Interest
+                                        </h3>
+                                        <div className="px-1 mt-4">
+                                            {['roi_enabled', 'roi_margin'].map(name => (
+                                                <ParamControl
+                                                    key={name}
+                                                    name={name}
+                                                    config={PARAM_CONFIG[name]}
+                                                    value={params[name]}
+                                                    onChange={handleParamChange}
+                                                    params={params}
+                                                />
+                                            ))}
+                                        </div>
+                                    </div>
 
-                                    {/* Detection Section */}
-                                    <h3 className="text-sm font-medium text-gray-700 mb-2 mt-4 border-b border-gray-300 pb-1">
-                                        Detection
-                                    </h3>
-                                    {['use_reference_threshold', 'min_flash_area', 'alignment_method', 'ransac_threshold'].map(name => (
-                                        <ParamControl
-                                            key={name}
-                                            name={name}
-                                            config={PARAM_CONFIG[name]}
-                                            value={params[name]}
-                                            onChange={handleParamChange}
-                                            params={params}
-                                        />
-                                    ))}
+                                    {/* Step 4: Alignment */}
+                                    <div className="mb-6">
+                                        <h3 className="text-base font-bold text-gray-800 mb-3 mt-3 pb-2 border-b-2 border-purple-400 bg-purple-50 px-2 py-2 rounded">
+                                            4. Alignment
+                                        </h3>
+                                        <div className="px-1 mt-4">
+                                            {['alignment_method', 'ransac_threshold'].map(name => (
+                                                <ParamControl
+                                                    key={name}
+                                                    name={name}
+                                                    config={PARAM_CONFIG[name]}
+                                                    value={params[name]}
+                                                    onChange={handleParamChange}
+                                                    params={params}
+                                                />
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* Step 5: Flash Detection */}
+                                    <div className="mb-6">
+                                        <h3 className="text-base font-bold text-gray-800 mb-3 mt-3 pb-2 border-b-2 border-purple-400 bg-purple-50 px-2 py-2 rounded">
+                                            5. Flash Detection
+                                        </h3>
+                                        <div className="px-1 mt-4">
+                                            {['use_reference_threshold', 'min_flash_area', 'analyze_individual_holes', 'min_hole_area'].map(name => (
+                                                <ParamControl
+                                                    key={name}
+                                                    name={name}
+                                                    config={PARAM_CONFIG[name]}
+                                                    value={params[name]}
+                                                    onChange={handleParamChange}
+                                                    params={params}
+                                                />
+                                            ))}
+                                        </div>
+                                    </div>
                                 </div>
 
                                 {/* Reference Info */}
                                 {referenceInfo && (
-                                    <div className="mt-4 p-3 bg-gray-100 rounded text-xs border border-gray-200">
-                                        <div className="text-gray-600">Threshold: <span className="text-gray-900 font-medium">{referenceInfo.threshold}</span></div>
-                                        <div className="text-gray-600">ROI Center: <span className="text-gray-900 font-medium">{referenceInfo.roi_center?.join(', ')}</span></div>
-                                        <div className="text-gray-600">ROI Radius: <span className="text-gray-900 font-medium">{referenceInfo.roi_radius}px</span></div>
+                                    <div className="mt-4">
+                                        {/* Show indicator if using saved reference */}
+                                        {appliedRotation !== 0 && (
+                                            <div className="mb-2 p-2 bg-green-50 border border-green-300 rounded text-xs text-green-800">
+                                                ✓ Using saved golden image (rotation: {appliedRotation}°)
+                                            </div>
+                                        )}
+                                        <div className="p-3 bg-gray-100 rounded text-xs border border-gray-200">
+                                            <div className="text-gray-600">Threshold: <span className="text-gray-900 font-medium">{referenceInfo.threshold}</span></div>
+                                            <div className="text-gray-600">ROI Center: <span className="text-gray-900 font-medium">{referenceInfo.roi_center?.join(', ')}</span></div>
+                                            <div className="text-gray-600">ROI Radius: <span className="text-gray-900 font-medium">{referenceInfo.roi_radius}px</span></div>
+                                        </div>
                                     </div>
                                 )}
                             </div>
